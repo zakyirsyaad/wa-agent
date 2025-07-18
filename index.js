@@ -1,15 +1,7 @@
 import express from "express";
 import dotenv from "dotenv";
 import OpenAI from "openai";
-import { createClient } from "@supabase/supabase-js";
-import { getUser } from "./hook.js";
-import {
-  Agent,
-  fileSearchTool,
-  run,
-  tool,
-  webSearchTool,
-} from "@openai/agents";
+import supabase from "./db.js"; // Menggunakan koneksi Supabase dari db.js
 import { z } from "zod";
 import axios from "axios";
 
@@ -20,315 +12,262 @@ app.use(express.json());
 const PORT = process.env.PORT || 3001;
 const client = new OpenAI();
 
-// Initialize Supabase client
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_ANON_KEY;
-const supabase = createClient(supabaseUrl, supabaseKey);
+// ID Asisten General Purpose (Default)
+// Anda harus membuat satu asisten di dashboard OpenAI sebagai fallback.
+const GENERAL_PURPOSE_ASSISTANT_ID = process.env.GENERAL_PURPOSE_ASSISTANT_ID;
 
-// Helper function to clean JSON response from markdown formatting
-function cleanJsonResponse(response) {
-  // Remove markdown code blocks if present
-  let cleaned = response.replace(/```json\s*/g, "").replace(/```\s*$/g, "");
-  // Remove any leading/trailing whitespace
-  cleaned = cleaned.trim();
-  return cleaned;
-}
+// --- Definisi Tools ---
+// Tools ini akan kita referensikan saat membuat asisten
 
-// Example of how to use getUser function
-const user = await getUser("6282223334444");
+const trackWalletTool = {
+  type: "function",
+  function: {
+    name: "track_wallet",
+    description: "Lacak dan tampilkan informasi saldo wallet berdasarkan address dan chain (ethereum, bsc, polygon).",
+    parameters: {
+      type: "object",
+      properties: {
+        address: { type: "string", description: "Alamat wallet yang akan dilacak." },
+        chain: { type: "string", description: "Chain atau jaringan (ethereum, bsc, atau polygon)." },
+      },
+      required: ["address", "chain"],
+    },
+  },
+};
 
-console.log(user.character);
-
-app.post("/api/v1/create-character", async (req, res) => {
-  try {
-    const { message, waNumber } = req.body;
-
-    const response = await client.responses.create({
-      model: "gpt-4o-mini",
-      input: `
-          this is format character i want to be create, ${message}.
-          Create a character definition in JSON format with the following structure:
-
-          {
-            "owner": "Name"
-            "name_agent": "YourAgentName",
-            "bio": "A short description of the character, including their purpose and tone.",
-            "adjectives": ["list", "of", "3", "adjectives", "describing", "the", "character"],
-            "knowledge": ["list of statements that the character knows about themselves or their purpose"],
-            "messageExamples": [
-              [
-                {
-                  "name": "user" or "owner",
-                  "content": {"text": "Hello!"}
-                },
-                {
-                  "name": "YourAgentName",
-                  "content": {"text": "Friendly greeting response."}
-                }
-              ]
-            ],
-            "task": ["list", "of", "tasks", "or", "instructions", "for", "the", "character"]
-          }
-
-          The character should be designed for interacting with users on WhatsApp. Make sure the tone feels natural and personalized. Make the character feel like a smart, reliable, and friendly assistant. You may change the name and behavior based on the use case. For adjective, knowledge, message examples, and task are not filled with your user who helps to make.
-      
-          Output only the JSON.
-          `,
-      temperature: 0.7,
-    });
-
-    const cleanedResponse = cleanJsonResponse(response.output_text);
-    const characterData = JSON.parse(cleanedResponse);
-
-    const { error } = await supabase
-      .from("users")
-      .update({ character: characterData })
-      .eq("id", waNumber)
-      .select();
-
-    if (error) {
-      console.error("Supabase error:", error);
-      return res.status(500).json({ error: "Database error" });
-    }
-
-    res.json({ response: characterData });
-  } catch (error) {
-    console.error("Create character error:", error);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
-
-app.post("/api/v1/update-character", async (req, res) => {
-  try {
-    const { waNumber, message } = req.body;
-    if (!waNumber || !message) {
-      return res
-        .status(400)
-        .json({ error: "waNumber and message are required" });
-    }
-
-    // Generate karakter baru dari prompt menggunakan OpenAI (sama seperti create-character)
-    const response = await client.responses.create({
-      model: "gpt-4o-mini",
-      input: `
-          this is format character i want to be update, ${message}.
-          Create a character definition in JSON format with the following structure:
-
-          {
-            "owner": "Name"
-            "name_agent": "YourAgentName",
-            "bio": "A short description of the character, including their purpose and tone.",
-            "adjectives": ["list", "of", "3", "adjectives", "describing", "the", "character"],
-            "knowledge": ["list of statements that the character knows about themselves or their purpose"],
-            "messageExamples": [
-              [
-                {
-                 "name": "user" or "owner",
-                  "content": {"text": "Hello!"}
-                },
-                {
-                  "name": "YourAgentName",
-                  "content": {"text": "Friendly greeting response."}
-                }
-              ]
-            ],
-            "task": ["list", "of", "tasks", "or", "instructions", "for", "the", "character"]
-          }
-
-          The character should be designed for interacting with users on WhatsApp. Make sure the tone feels natural and personalized. Make the character feel like a smart, reliable, and friendly assistant. You may change the name and behavior based on the use case. For adjective, knowledge, message examples, and task are not filled with your user who helps to make.
-      
-          Output only the JSON.
-          `,
-      temperature: 0.7,
-    });
-
-    const cleanedResponse = cleanJsonResponse(response.output_text);
-    const characterData = JSON.parse(cleanedResponse);
-
-    const { error } = await supabase
-      .from("users")
-      .update({ character: characterData })
-      .eq("id", waNumber)
-      .select();
-
-    if (error) {
-      console.error("Supabase error:", error);
-      return res.status(500).json({ error: "Database error" });
-    }
-
-    res.json({
-      success: true,
-      message: "Character updated successfully",
-      character: characterData,
-    });
-  } catch (error) {
-    console.error("Update character error:", error);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
-
-const trackWalletTool = tool({
-  name: "track_wallet",
-  description:
-    "Lacak dan tampilkan informasi saldo wallet berdasarkan address dan chain (ethereum, bsc, polygon).",
-  parameters: z.object({
-    address: z.string(),
-    chain: z.string(),
-  }),
-  async execute({ address, chain }) {
+// --- Fungsi Eksekusi Tools ---
+// Objek untuk memetakan nama tool ke fungsi eksekusinya
+const toolExecutors = {
+  track_wallet: async ({ address, chain }) => {
     let apiUrl = "";
     let apiKey = "";
     let label = chain.toLowerCase();
     if (label === "ethereum") {
       apiUrl = `https://api.etherscan.io/api?module=account&action=balance&address=${address}&tag=latest&apikey=${process.env.ETHERSCAN_API_KEY}`;
       apiKey = process.env.ETHERSCAN_API_KEY;
-    } else if (
-      label === "bsc" ||
-      label === "binance" ||
-      label === "binance smart chain"
-    ) {
+    } else if (["bsc", "binance", "binance smart chain"].includes(label)) {
       apiUrl = `https://api.bscscan.com/api?module=account&action=balance&address=${address}&apikey=${process.env.BSCSCAN_API_KEY}`;
       apiKey = process.env.BSCSCAN_API_KEY;
-    } else if (label === "polygon" || label === "matic") {
+    } else if (["polygon", "matic"].includes(label)) {
       apiUrl = `https://api.polygonscan.com/api?module=account&action=balance&address=${address}&apikey=${process.env.POLYGONSCAN_API_KEY}`;
       apiKey = process.env.POLYGONSCAN_API_KEY;
     } else {
       return `Maaf, chain '${chain}' belum didukung. Coba gunakan ethereum, bsc, atau polygon.`;
     }
-    if (!apiKey) {
-      return `API key untuk chain '${chain}' belum diatur. Hubungi admin.`;
-    }
+    if (!apiKey) return `API key untuk chain '${chain}' belum diatur. Hubungi admin.`;
     try {
       const resp = await axios.get(apiUrl);
       if (resp.data.status === "1") {
-        // Saldo biasanya dalam wei, konversi ke ETH/BNB/MATIC
         const balance = Number(resp.data.result) / 1e18;
-        let symbol =
-          label === "ethereum" ? "ETH" : label === "bsc" ? "BNB" : "MATIC";
+        const symbol = label === "ethereum" ? "ETH" : label === "bsc" ? "BNB" : "MATIC";
         return `Saldo wallet ${address} di jaringan ${chain}: ${balance} ${symbol}`;
       } else {
-        return `Gagal mengambil data wallet: ${
-          resp.data.message || "Unknown error"
-        }`;
+        return `Gagal mengambil data wallet: ${resp.data.message || "Unknown error"}`;
       }
     } catch (err) {
       return `Terjadi error saat mengambil data wallet: ${err.message}`;
     }
   },
+};
+
+// --- Endpoint untuk Manajemen Asisten ---
+
+app.post("/api/v1/assistants", async (req, res) => {
+  try {
+    const { userId, name, instructions, description } = req.body;
+    if (!userId || !name || !instructions) {
+      return res.status(400).json({ error: "userId, name, dan instructions diperlukan." });
+    }
+
+    // Membuat asisten di OpenAI
+    const assistant = await client.beta.assistants.create({
+      name: name,
+      instructions: instructions,
+      tools: [trackWalletTool, { type: "code_interpreter" }, { type: "file_search" }], // Updated from 'retrieval' to 'file_search'
+      model: "gpt-4o-mini",
+    });
+
+    // Cek apakah user sudah punya asisten lain, jika tidak, jadikan ini default
+    const { data: userAssistants, error: countError } = await supabase.from("assistants").select("id", { count: "exact" }).eq("user_id", userId);
+
+    if (countError) throw countError;
+
+    // Simpan asisten ke database
+    const { data, error } = await supabase
+      .from("assistants")
+      .insert({
+        user_id: userId,
+        assistant_id: assistant.id,
+        name: name,
+        description: description,
+        instructions: instructions,
+        is_default: userAssistants.length === 0, // Jadi default jika ini yg pertama
+      })
+      .select();
+
+    if (error) throw error;
+
+    res.status(201).json({ message: "Asisten berhasil dibuat.", assistant: data[0] });
+  } catch (error) {
+    console.error("Error creating assistant:", error);
+    res.status(500).json({ error: "Gagal membuat asisten." });
+  }
 });
 
-function createAgentFromCharacter(characterData) {
-  if (!characterData.name_agent) {
-    throw new Error(
-      "Character data must have 'name_agent' field. Please update character."
-    );
-  }
-
-  // Generate tools dari task
-  const dynamicTaskTools = (characterData.task || []).map((task, idx) =>
-    tool({
-      name: `task_${idx + 1}`,
-      description: `Lakukan tugas berikut: ${task}`,
-      parameters: z.object({}),
-      execute: async () => `Tugas \"${task}\" telah dijalankan.`,
-    })
-  );
-
-  return new Agent({
-    name: characterData.name_agent,
-    instructions: `
-      ${characterData.bio}
-      Adjektif: ${characterData.adjectives.join(", ")}
-      Pengetahuan: ${characterData.knowledge.join("; ")}
-      Tugas kamu:
-      - Selalu merespons sebagai karakter ini, jaga nada, kepribadian, dan pengetahuan sesuai data di atas.
-      - Jangan pernah keluar dari karakter.
-      - Jangan sebutkan bahwa kamu adalah AI kecuali diminta.
-      - Balas secara natural seolah-olah kamu benar-benar ${
-        characterData.name_agent
-      },
-      - Jika ada pertanyaan di luar pengetahuan karakter, jawab dengan cara yang tetap sesuai karakter.
-      - Jika user meminta untuk melacak wallet, gunakan tool track_wallet.
-      Contoh gaya bicara:
-      ${(characterData.messageExamples || [])
-        .map(
-          (ex, i) =>
-            `Contoh ${i + 1}:\n` +
-            ex.map((e) => `${e.name_agent}: ${e.content.text}`).join("\n")
-        )
-        .join("\n\n")}
-    `,
-    tools: [...dynamicTaskTools, trackWalletTool, webSearchTool()],
-  });
-}
+// --- Endpoint untuk Chat ---
 
 app.post("/api/v1/chat", async (req, res) => {
   try {
-    const { message, userId } = req.body;
-
-    // Get user and character data
-    const user = await getUser(userId || "");
-    const characterData = user.character;
-
-    if (!characterData) {
-      return res
-        .status(400)
-        .json({ error: "Character not found for this user" });
+    const { userId, message } = req.body;
+    if (!userId || !message) {
+      return res.status(400).json({ error: "userId dan message diperlukan." });
     }
 
-    // Ambil seluruh riwayat percakapan user
-    const { data: history, error: historyError } = await supabase
-      .from("messages")
-      .select("role, message")
+    // 1. Dapatkan atau Buat Thread ID untuk User
+    let { data: user, error: userError } = await supabase.from("users").select("thread_id").eq("id", userId).single();
+
+    if (userError && userError.code !== "PGRST116") throw userError; // Abaikan error jika user not found
+
+    let threadId;
+    if (user && user.thread_id) {
+      threadId = user.thread_id;
+    } else {
+      const thread = await client.beta.threads.create();
+      threadId = thread.id;
+      // Simpan threadId ke user
+      const { error: updateError } = await supabase.from("users").upsert({ id: userId, thread_id: threadId }, { onConflict: "id" });
+      if (updateError) throw updateError;
+    }
+
+    console.log("Thread ID:", threadId); // Debug log
+
+    // Validate threadId before proceeding
+    if (!threadId) {
+      console.error("Thread ID is undefined or null");
+      return res.status(500).json({ error: "Failed to create or retrieve thread ID" });
+    }
+
+    // Store threadId in a const to prevent accidental reassignment
+    const finalThreadId = threadId;
+
+    // 2. Pilih Asisten yang Akan Digunakan
+    const words = message.trim().split(" ");
+    const potentialName = words[0].replace(/,$/, ""); // Hapus koma jika ada (misal: "Fina,")
+
+    let assistantId;
+    let finalMessage = message;
+
+    const { data: namedAssistant, error: namedError } = await supabase
+      .from("assistants")
+      .select("assistant_id")
       .eq("user_id", userId)
-      .order("timestamp", { ascending: true });
+      .ilike("name", potentialName) // Case-insensitive search
+      .single();
 
-    if (historyError) {
-      console.error("History fetch error:", historyError);
+    if (namedAssistant) {
+      assistantId = namedAssistant.assistant_id;
+      finalMessage = words.slice(1).join(" "); // Hapus nama dari pesan
+    } else {
+      const { data: defaultAssistant, error: defaultError } = await supabase.from("assistants").select("assistant_id").eq("user_id", userId).eq("is_default", true).single();
+
+      if (defaultAssistant) {
+        assistantId = defaultAssistant.assistant_id;
+      } else {
+        assistantId = GENERAL_PURPOSE_ASSISTANT_ID;
+      }
     }
 
-    // Gabungkan riwayat ke dalam satu string
-    const chatHistory = (history || [])
-      .map(
-        (msg) =>
-          `${msg.role === "user" ? "User" : "Assistant"}: ${msg.message.text}`
-      )
-      .join("\n");
+    console.log("Assistant ID:", assistantId); // Debug log
 
-    // Gabungkan dengan pesan terbaru
-    const fullPrompt = `${chatHistory}${
-      chatHistory ? "\n" : ""
-    }User: ${message}\nAssistant:`;
+    // Validate assistantId before proceeding
+    if (!assistantId) {
+      console.error("Assistant ID is undefined or null");
+      return res.status(500).json({ error: "Failed to retrieve assistant ID" });
+    }
 
-    // Buat agent dari karakter user
-    const agent = createAgentFromCharacter(characterData);
+    // 3. Jalankan Siklus Chat
+    await client.beta.threads.messages.create(finalThreadId, {
+      role: "user",
+      content: finalMessage,
+    });
 
-    // Jalankan agent dengan input berisi seluruh riwayat + pesan terbaru
-    const result = await run(agent, fullPrompt);
+    let run = await client.beta.threads.runs.create(finalThreadId, {
+      assistant_id: assistantId,
+    });
 
-    // Simpan pesan user & AI ke database
-    await supabase.from("messages").insert([
-      {
-        user_id: userId,
-        role: "user",
-        message: { text: String(message) },
-        timestamp: new Date(),
-      },
-      {
-        user_id: userId,
-        role: "assistant",
-        message: { text: String(result.finalOutput) },
-        timestamp: new Date(),
-      },
-    ]);
+    console.log("Run ID:", run.id); // Debug log
 
-    res.json({ response: result.finalOutput });
+    // Polling untuk status run
+    while (["queued", "in_progress", "cancelling"].includes(run.status)) {
+      await new Promise((resolve) => setTimeout(resolve, 1000)); // Tunggu 1 detik
+      console.log("About to retrieve run with threadId:", finalThreadId, "runId:", run.id);
+
+      // Use list method instead of retrieve to avoid SDK bug
+      const runs = await client.beta.threads.runs.list(finalThreadId, { limit: 1 });
+      if (runs.data && runs.data.length > 0) {
+        run = runs.data[0];
+        console.log("Run status:", run.status); // Debug log
+      } else {
+        console.error("No runs found for thread");
+        break;
+      }
+    }
+
+    if (run.status === "requires_action") {
+      const toolOutputs = [];
+      for (const toolCall of run.required_action.submit_tool_outputs.tool_calls) {
+        const executor = toolExecutors[toolCall.function.name];
+        if (executor) {
+          const args = JSON.parse(toolCall.function.arguments);
+          const output = await executor(args);
+          toolOutputs.push({
+            tool_call_id: toolCall.id,
+            output: String(output),
+          });
+        }
+      }
+      run = await client.beta.threads.runs.submitToolOutputs(finalThreadId, run.id, {
+        tool_outputs: toolOutputs,
+      });
+      // Polling lagi setelah submit tool output
+      while (["queued", "in_progress", "cancelling"].includes(run.status)) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        console.log("About to retrieve run after tool output with threadId:", finalThreadId, "runId:", run.id);
+
+        // Use list method instead of retrieve to avoid SDK bug
+        const runs = await client.beta.threads.runs.list(finalThreadId, { limit: 1 });
+        if (runs.data && runs.data.length > 0) {
+          run = runs.data[0];
+          console.log("Run status after tool output:", run.status); // Debug log
+        } else {
+          console.error("No runs found for thread after tool output");
+          break;
+        }
+      }
+    }
+
+    if (run.status === "completed") {
+      const messages = await client.beta.threads.messages.list(finalThreadId);
+      const lastMessage = messages.data.find((m) => m.run_id === run.id && m.role === "assistant");
+
+      if (lastMessage && lastMessage.content[0].type === "text") {
+        res.json({ response: lastMessage.content[0].text.value });
+      } else {
+        res.json({ response: "Saya tidak dapat menemukan jawaban yang sesuai." });
+      }
+    } else {
+      console.error("Run failed with status:", run.status);
+      if (run.last_error) {
+        console.error("Run error details:", run.last_error);
+      }
+      res.status(500).json({ error: "Terjadi kesalahan pada AI.", details: run.last_error });
+    }
   } catch (error) {
     console.error("Chat error:", error);
-    res.status(500).json({ error: "Internal server error" });
+    res.status(500).json({ error: "Internal server error." });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`Server is runing on port ${PORT}`);
+  console.log(`Server is running on port ${PORT}`);
 });
