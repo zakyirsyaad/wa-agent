@@ -5,11 +5,11 @@ import supabase from "./db.js";
 import multer from "multer";
 import { Readable } from "stream";
 import axios from "axios";
-import { default as makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, downloadMediaMessage } from '@whiskeysockets/baileys';
-import { Boom } from '@hapi/boom';
-import pino from 'pino';
-import path from 'path';
-import fs from 'fs/promises'; // Menggunakan fs/promises untuk async/await
+import { default as makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, downloadMediaMessage } from "@whiskeysockets/baileys";
+import { Boom } from "@hapi/boom";
+import pino from "pino";
+import path from "path";
+import fs from "fs/promises"; // Menggunakan fs/promises untuk async/await
 
 dotenv.config();
 
@@ -110,16 +110,31 @@ async function processAssistantMessage(userId, messageContent, fileBuffer = null
 
   // Cancel any active runs on this thread before proceeding
   try {
-    const activeRuns = await client.beta.threads.runs.list(finalThreadId, { limit: 1 });
-    if (activeRuns.data.length > 0) {
-      const lastRun = activeRuns.data[0];
-      if (['queued', 'in_progress', 'cancelling'].includes(lastRun.status)) {
-        console.log(`Cancelling active run ${lastRun.id} for thread ${finalThreadId}`);
-        await client.beta.threads.runs.cancel(finalThreadId, lastRun.id);
+    const runs = await client.beta.threads.runs.list(finalThreadId, { limit: 1 });
+
+    if (runs.data.length > 0) {
+      let lastRun = runs.data[0];
+
+      // Check if the last run is in a non-terminal state
+      if (["queued", "in_progress", "cancelling"].includes(lastRun.status)) {
+        console.log(`An active run (${lastRun.id}) was found with status: ${lastRun.status}. Attempting to cancel.`);
+
+        // Cancel the active run
+        lastRun = await client.beta.threads.runs.cancel(finalThreadId, lastRun.id);
+
+        // Poll the run's status until it reaches a terminal state
+        while (["queued", "in_progress", "cancelling"].includes(lastRun.status)) {
+          await new Promise((resolve) => setTimeout(resolve, 500)); // Wait 500ms between checks
+          lastRun = await client.beta.threads.runs.retrieve(finalThreadId, lastRun.id);
+          console.log(`... Awaiting cancellation. Current status: ${lastRun.status}`);
+        }
+
+        console.log(`Run ${lastRun.id} is now in a terminal state: ${lastRun.status}. Proceeding with new message.`);
       }
     }
-  } catch (cancelError) {
-    console.error(`Error cancelling active runs for thread ${finalThreadId}:`, cancelError);
+  } catch (error) {
+    console.error(`Error while checking or cancelling active runs for thread ${finalThreadId}:`, error);
+    // Depending on your app's needs, you might want to return an error response here
   }
 
   let assistantId;
@@ -156,7 +171,7 @@ async function processAssistantMessage(userId, messageContent, fileBuffer = null
           read() {
             this.push(fileBuffer);
             this.push(null);
-          }
+          },
         }),
         purpose: "assistants",
         fileName: fileName,
@@ -172,7 +187,7 @@ async function processAssistantMessage(userId, messageContent, fileBuffer = null
   await client.beta.threads.messages.create(finalThreadId, {
     role: "user",
     content: finalMessage,
-    attachments: fileIds.length > 0 ? [{ file_id: fileIds[0], tools: [{ "type": "code_interpreter" }, { "type": "file_search" }] }] : []
+    attachments: fileIds.length > 0 ? [{ file_id: fileIds[0], tools: [{ type: "code_interpreter" }, { type: "file_search" }] }] : [],
   });
 
   let run = await client.beta.threads.runs.create(finalThreadId, {
@@ -207,7 +222,7 @@ async function processAssistantMessage(userId, messageContent, fileBuffer = null
   }
 
   if (run.status === "completed") {
-    const messages = await client.beta.threads.messages.list(finalThreadId, { order: 'desc', limit: 1 });
+    const messages = await client.beta.threads.messages.list(finalThreadId, { order: "desc", limit: 1 });
     const lastMessage = messages.data.find((m) => m.run_id === run.id && m.role === "assistant");
 
     if (lastMessage) {
@@ -219,48 +234,48 @@ async function processAssistantMessage(userId, messageContent, fileBuffer = null
 
           if (annotations && annotations.length > 0) {
             for (const annotation of annotations) {
-              if (annotation.type === 'file_path') {
+              if (annotation.type === "file_path") {
                 const fileId = annotation.file_path.file_id;
                 try {
                   const fileContent = await client.files.content(fileId);
                   const fileData = await fileContent.arrayBuffer();
-                  const tempDir = path.join(__dirname, 'temp');
+                  const tempDir = path.join(__dirname, "temp");
                   await fs.mkdir(tempDir, { recursive: true });
                   const tempFilePath = path.join(tempDir, `openai_file_${fileId}_${Date.now()}`); // Nama file unik
                   await fs.writeFile(tempFilePath, Buffer.from(fileData));
 
-                  responses.push({ type: 'document', path: tempFilePath, fileName: `file_${fileId}` });
+                  responses.push({ type: "document", path: tempFilePath, fileName: `file_${fileId}` });
                   responseText = responseText.replace(annotation.text, `[File ${fileId} telah dikirim]`);
                 } catch (fileDownloadError) {
                   console.error(`Error mengunduh file ${fileId} dari OpenAI:`, fileDownloadError);
                   responseText = responseText.replace(annotation.text, `[Gagal mengunduh file ${fileId}]`);
                 }
-              } else if (annotation.type === 'file_citation') {
+              } else if (annotation.type === "file_citation") {
                 // Handle file citation if needed, for now just remove the annotation text
                 responseText = responseText.replace(annotation.text, "");
               }
             }
           }
-          responses.push({ type: 'text', content: responseText.trim() });
+          responses.push({ type: "text", content: responseText.trim() });
         } else if (content.type === "image_file") {
           const fileId = content.image_file.file_id;
           try {
             const fileContent = await client.files.content(fileId);
             const imageData = await fileContent.arrayBuffer();
-            const tempDir = path.join(__dirname, 'temp');
+            const tempDir = path.join(__dirname, "temp");
             await fs.mkdir(tempDir, { recursive: true });
             const tempFilePath = path.join(tempDir, `openai_image_${fileId}_${Date.now()}.png`); // Asumsi PNG
             await fs.writeFile(tempFilePath, Buffer.from(imageData));
-            responses.push({ type: 'image', path: tempFilePath });
+            responses.push({ type: "image", path: tempFilePath });
           } catch (imageDownloadError) {
             console.error(`Error mengunduh gambar ${fileId} dari OpenAI:`, imageDownloadError);
-            responses.push({ type: 'text', content: `[Gagal mengunduh gambar ${fileId}]` });
+            responses.push({ type: "text", content: `[Gagal mengunduh gambar ${fileId}]` });
           }
         }
       }
       return { success: true, responses: responses };
     } else {
-      return { success: true, responses: [{ type: 'text', content: "Saya tidak dapat menemukan jawaban yang sesuai." }] };
+      return { success: true, responses: [{ type: "text", content: "Saya tidak dapat menemukan jawaban yang sesuai." }] };
     }
   } else {
     console.error("Run failed with status:", run.status, run.last_error);
@@ -438,7 +453,7 @@ app.post("/api/v1/chat", async (req, res) => {
       const activeRuns = await client.beta.threads.runs.list(finalThreadId, { limit: 1 });
       if (activeRuns.data.length > 0) {
         const lastRun = activeRuns.data[0];
-        if (['queued', 'in_progress', 'cancelling'].includes(lastRun.status)) {
+        if (["queued", "in_progress", "cancelling"].includes(lastRun.status)) {
           console.log(`Cancelling active run ${lastRun.id} for thread ${finalThreadId}`);
           await client.beta.threads.runs.cancel(finalThreadId, lastRun.id);
         }
@@ -542,8 +557,7 @@ app.post("/api/v1/chat", async (req, res) => {
       console.error("Run failed with status:", run.status, run.last_error);
       res.status(500).json({ error: "Terjadi kesalahan pada AI.", details: run.last_error });
     }
-  }
- catch (error) {
+  } catch (error) {
     console.error("Chat error:", error);
     res.status(500).json({ error: "Internal server error." });
   }
