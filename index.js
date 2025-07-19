@@ -5,6 +5,11 @@ import supabase from "./db.js";
 import multer from "multer";
 import { Readable } from "stream";
 import axios from "axios";
+import { default as makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, downloadMediaMessage } from '@whiskeysockets/baileys';
+import { Boom } from '@hapi/boom';
+import pino from 'pino';
+import path from 'path';
+import fs from 'fs/promises'; // Menggunakan fs/promises untuk async/await
 
 dotenv.config();
 
@@ -69,8 +74,202 @@ const toolExecutors = {
   },
 };
 
-// --- Endpoint untuk Manajemen Asisten ---
+// --- Fungsi Utama untuk Berinteraksi dengan OpenAI Assistant ---
+async function processAssistantMessage(userId, messageContent, fileBuffer = null, fileName = null, sock = null) {
+  let threadId = null;
+  try {
+    let { data: user, error: userError } = await supabase.from("users").select("thread_id").eq("id", userId).single();
 
+    if (userError && userError.code !== "PGRST116") {
+      console.error("Supabase user query error:", userError);
+      throw userError;
+    }
+
+    if (user && user.thread_id) {
+      threadId = user.thread_id;
+    } else {
+      const thread = await client.beta.threads.create();
+      threadId = thread.id;
+      const { error: updateError } = await supabase.from("users").upsert({ id: userId, thread_id: threadId }, { onConflict: "id" });
+      if (updateError) {
+        console.error("Supabase threadId upsert error:", updateError);
+        throw updateError;
+      }
+    }
+  } catch (err) {
+    console.error("Error mendapatkan atau membuat thread ID:", err);
+    return { error: "Gagal mendapatkan atau membuat thread ID.", details: err.message };
+  }
+
+  if (!threadId) {
+    console.error("Thread ID masih undefined setelah proses akuisisi.");
+    return { error: "Gagal mendapatkan thread ID yang valid." };
+  }
+
+  const finalThreadId = threadId;
+
+  // Cancel any active runs on this thread before proceeding
+  try {
+    const activeRuns = await client.beta.threads.runs.list(finalThreadId, { limit: 1 });
+    if (activeRuns.data.length > 0) {
+      const lastRun = activeRuns.data[0];
+      if (['queued', 'in_progress', 'cancelling'].includes(lastRun.status)) {
+        console.log(`Cancelling active run ${lastRun.id} for thread ${finalThreadId}`);
+        await client.beta.threads.runs.cancel(finalThreadId, lastRun.id);
+      }
+    }
+  } catch (cancelError) {
+    console.error(`Error cancelling active runs for thread ${finalThreadId}:`, cancelError);
+  }
+
+  let assistantId;
+  let finalMessage = messageContent;
+
+  // Logika untuk memilih asisten (default atau berdasarkan nama)
+  const words = messageContent.trim().split(" ");
+  const potentialName = words[0].replace(/,$/, "");
+
+  const { data: namedAssistant, error: namedError } = await supabase.from("assistants").select("assistant_id, vector_store_id").eq("user_id", userId).ilike("name", potentialName).single();
+
+  let assistantToUse;
+  if (namedAssistant) {
+    assistantToUse = namedAssistant;
+    finalMessage = words.slice(1).join(" ");
+  } else {
+    const { data: defaultAssistant, error: defaultError } = await supabase.from("assistants").select("assistant_id, vector_store_id").eq("user_id", userId).eq("is_default", true).single();
+    if (defaultAssistant) {
+      assistantToUse = defaultAssistant;
+    } else {
+      // Jika tidak ada asisten default di DB, gunakan GENERAL_PURPOSE_ASSISTANT_ID dari .env
+      // Pastikan GENERAL_PURPOSE_ASSISTANT_ID ini sudah diatur dengan code_interpreter dan file_search
+      assistantToUse = { assistant_id: GENERAL_PURPOSE_ASSISTANT_ID, vector_store_id: null };
+    }
+  }
+
+  assistantId = assistantToUse.assistant_id;
+
+  let fileIds = [];
+  if (fileBuffer && fileName) {
+    try {
+      const file = await client.files.create({
+        file: new Readable({
+          read() {
+            this.push(fileBuffer);
+            this.push(null);
+          }
+        }),
+        purpose: "assistants",
+        fileName: fileName,
+      });
+      fileIds.push(file.id);
+      console.log(`File ${fileName} diunggah ke OpenAI dengan ID: ${file.id}`);
+    } catch (uploadError) {
+      console.error("Error mengunggah file ke OpenAI:", uploadError);
+      return { error: "Gagal mengunggah file ke AI.", details: uploadError.message };
+    }
+  }
+
+  await client.beta.threads.messages.create(finalThreadId, {
+    role: "user",
+    content: finalMessage,
+    attachments: fileIds.length > 0 ? [{ file_id: fileIds[0], tools: [{ "type": "code_interpreter" }, { "type": "file_search" }] }] : []
+  });
+
+  let run = await client.beta.threads.runs.create(finalThreadId, {
+    assistant_id: assistantId,
+  });
+
+  while (["queued", "in_progress", "cancelling"].includes(run.status)) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    run = await client.beta.threads.runs.retrieve(finalThreadId, run.id);
+  }
+
+  if (run.status === "requires_action") {
+    const toolOutputs = [];
+    for (const toolCall of run.required_action.submit_tool_outputs.tool_calls) {
+      const executor = toolExecutors[toolCall.function.name];
+      if (executor) {
+        const args = JSON.parse(toolCall.function.arguments);
+        const output = await executor(args);
+        toolOutputs.push({
+          tool_call_id: toolCall.id,
+          output: String(output),
+        });
+      }
+    }
+    run = await client.beta.threads.runs.submitToolOutputs(finalThreadId, run.id, {
+      tool_outputs: toolOutputs,
+    });
+    while (["queued", "in_progress", "cancelling"].includes(run.status)) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      run = await client.beta.threads.runs.retrieve(finalThreadId, run.id);
+    }
+  }
+
+  if (run.status === "completed") {
+    const messages = await client.beta.threads.messages.list(finalThreadId, { order: 'desc', limit: 1 });
+    const lastMessage = messages.data.find((m) => m.run_id === run.id && m.role === "assistant");
+
+    if (lastMessage) {
+      const responses = [];
+      for (const content of lastMessage.content) {
+        if (content.type === "text") {
+          let responseText = content.text.value;
+          const annotations = content.text.annotations;
+
+          if (annotations && annotations.length > 0) {
+            for (const annotation of annotations) {
+              if (annotation.type === 'file_path') {
+                const fileId = annotation.file_path.file_id;
+                try {
+                  const fileContent = await client.files.content(fileId);
+                  const fileData = await fileContent.arrayBuffer();
+                  const tempDir = path.join(__dirname, 'temp');
+                  await fs.mkdir(tempDir, { recursive: true });
+                  const tempFilePath = path.join(tempDir, `openai_file_${fileId}_${Date.now()}`); // Nama file unik
+                  await fs.writeFile(tempFilePath, Buffer.from(fileData));
+
+                  responses.push({ type: 'document', path: tempFilePath, fileName: `file_${fileId}` });
+                  responseText = responseText.replace(annotation.text, `[File ${fileId} telah dikirim]`);
+                } catch (fileDownloadError) {
+                  console.error(`Error mengunduh file ${fileId} dari OpenAI:`, fileDownloadError);
+                  responseText = responseText.replace(annotation.text, `[Gagal mengunduh file ${fileId}]`);
+                }
+              } else if (annotation.type === 'file_citation') {
+                // Handle file citation if needed, for now just remove the annotation text
+                responseText = responseText.replace(annotation.text, "");
+              }
+            }
+          }
+          responses.push({ type: 'text', content: responseText.trim() });
+        } else if (content.type === "image_file") {
+          const fileId = content.image_file.file_id;
+          try {
+            const fileContent = await client.files.content(fileId);
+            const imageData = await fileContent.arrayBuffer();
+            const tempDir = path.join(__dirname, 'temp');
+            await fs.mkdir(tempDir, { recursive: true });
+            const tempFilePath = path.join(tempDir, `openai_image_${fileId}_${Date.now()}.png`); // Asumsi PNG
+            await fs.writeFile(tempFilePath, Buffer.from(imageData));
+            responses.push({ type: 'image', path: tempFilePath });
+          } catch (imageDownloadError) {
+            console.error(`Error mengunduh gambar ${fileId} dari OpenAI:`, imageDownloadError);
+            responses.push({ type: 'text', content: `[Gagal mengunduh gambar ${fileId}]` });
+          }
+        }
+      }
+      return { success: true, responses: responses };
+    } else {
+      return { success: true, responses: [{ type: 'text', content: "Saya tidak dapat menemukan jawaban yang sesuai." }] };
+    }
+  } else {
+    console.error("Run failed with status:", run.status, run.last_error);
+    return { error: "Terjadi kesalahan pada AI.", details: run.last_error?.message || "Unknown error" };
+  }
+}
+
+// --- Endpoint untuk Manajemen Asisten ---
+// (Tetap sama seperti sebelumnya)
 app.post("/api/v1/assistants", async (req, res) => {
   const { userId, name, instructions, description } = req.body;
   if (!userId || !name || !instructions) {
@@ -81,7 +280,6 @@ app.post("/api/v1/assistants", async (req, res) => {
   let vectorStore = null;
 
   try {
-    // Langkah 1: Buat Asisten dasar dengan tool file_search diaktifkan
     console.log("Membuat asisten...");
     assistant = await client.beta.assistants.create({
       name: name,
@@ -91,21 +289,18 @@ app.post("/api/v1/assistants", async (req, res) => {
     });
     console.log(`Asisten dibuat dengan ID: ${assistant.id}`);
 
-    // Langkah 2: Buat Vector Store secara terpisah
     console.log("Membuat Vector Store...");
     vectorStore = await client.vectorStores.create({
       name: `Vector Store untuk ${name}`,
     });
     console.log(`Vector Store dibuat dengan ID: ${vectorStore.id}`);
 
-    // Langkah 3: UPDATE asisten untuk menautkan Vector Store
     console.log("Menautkan Vector Store ke Asisten...");
     await client.beta.assistants.update(assistant.id, {
       tool_resources: { file_search: { vector_store_ids: [vectorStore.id] } },
     });
     console.log("Asisten berhasil ditautkan.");
 
-    // Langkah 4: Simpan ke database
     const { count: userAssistantCount } = await supabase.from("assistants").select("*", { count: "exact", head: true }).eq("user_id", userId);
 
     const { data, error: insertError } = await supabase
@@ -131,7 +326,6 @@ app.post("/api/v1/assistants", async (req, res) => {
   } catch (error) {
     console.error("Terjadi kesalahan dalam proses pembuatan asisten:", error);
 
-    // Logika pembersihan jika proses gagal di tengah jalan
     if (assistant) {
       try {
         await client.beta.assistants.del(assistant.id);
@@ -157,7 +351,7 @@ app.post("/api/v1/assistants", async (req, res) => {
 });
 
 // --- Endpoint untuk Upload File ---
-
+// (Tetap sama seperti sebelumnya)
 app.post("/api/v1/assistants/:assistantId/files", upload.array("files"), async (req, res) => {
   try {
     const { assistantId } = req.params;
@@ -165,7 +359,6 @@ app.post("/api/v1/assistants/:assistantId/files", upload.array("files"), async (
       return res.status(400).json({ error: "Setidaknya satu file diperlukan." });
     }
 
-    // Dapatkan vector_store_id dari database
     const { data: assistant, error: dbError } = await supabase.from("assistants").select("vector_store_id").eq("assistant_id", assistantId).single();
 
     if (dbError || !assistant || !assistant.vector_store_id) {
@@ -173,11 +366,10 @@ app.post("/api/v1/assistants/:assistantId/files", upload.array("files"), async (
     }
     const vectorStoreId = assistant.vector_store_id;
 
-    // Ubah file buffer menjadi stream yang bisa dibaca
     const fileStreams = req.files.map((file) => {
       const readableStream = new Readable();
       readableStream.push(file.buffer);
-      readableStream.push(null); // Menandakan akhir stream
+      readableStream.push(null);
       readableStream.path = file.originalname;
       return readableStream;
     });
@@ -240,6 +432,20 @@ app.post("/api/v1/chat", async (req, res) => {
     }
 
     const finalThreadId = threadId;
+
+    // Cancel any active runs on this thread before proceeding
+    try {
+      const activeRuns = await client.beta.threads.runs.list(finalThreadId, { limit: 1 });
+      if (activeRuns.data.length > 0) {
+        const lastRun = activeRuns.data[0];
+        if (['queued', 'in_progress', 'cancelling'].includes(lastRun.status)) {
+          console.log(`Cancelling active run ${lastRun.id} for thread ${finalThreadId}`);
+          await client.beta.threads.runs.cancel(finalThreadId, lastRun.id);
+        }
+      }
+    } catch (cancelError) {
+      console.error(`Error cancelling active runs for thread ${finalThreadId}:`, cancelError);
+    }
 
     const words = message.trim().split(" ");
     const potentialName = words[0].replace(/,$/, "");
@@ -336,7 +542,8 @@ app.post("/api/v1/chat", async (req, res) => {
       console.error("Run failed with status:", run.status, run.last_error);
       res.status(500).json({ error: "Terjadi kesalahan pada AI.", details: run.last_error });
     }
-  } catch (error) {
+  }
+ catch (error) {
     console.error("Chat error:", error);
     res.status(500).json({ error: "Internal server error." });
   }
